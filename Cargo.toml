@@ -1,20 +1,27 @@
 [package]
-name = "nev-f1"
+name = "env-f1"
 version = "0.1.0"
 authors = ["solsticexin <solstice.xin@gmail.com>"]
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-panic-probe = { version = "0.3.1", features = ["defmt"] }
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+embedded-graphics = "0.8.1"
+embedded-hal = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["defmt"] }
+st7735-lcd = { version = "0.10.0", features = ["graphics"] }
 
 
 [dependencies.stm32f1xx-hal]
 version = "0.11.0"
 features = ["stm32f103", ]
 
-
+[[bin]]
+name = "env-f1"
+test = false
 
 # Set the default for dependencies.
 [profile.dev.package."*"]
