@@ -95,6 +95,9 @@ where
             return Err(Error::Checksum);
         }
 
+        // 添加调试输出
+        defmt::info!("DHT11 raw data: {} {} {} {} {}", data[0], data[1], data[2], data[3], data[4]);
+
         let humidity_tenths =
             u16::from(data[0]) * 10 + u16::from(data[1]);
         let temperature_tenths =

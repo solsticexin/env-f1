@@ -218,6 +218,7 @@ dependencies = [
  "embedded-graphics",
  "embedded-hal 1.0.0",
  "heapless",
+ "nb 1.1.0",
  "panic-probe",
  "st7735-lcd",
  "stm32f1xx-hal",
