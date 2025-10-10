@@ -17,7 +17,11 @@ use embedded_hal::{
 };
 use st7735_lcd::{Orientation, ST7735};
 use stm32f1xx_hal::{
-    gpio::{gpioa::{self, PA2, PA3, PA4}, Floating, Input, Output, PushPull},
+    gpio::{
+        gpioa::{PA2, PA3, PA4, PA5, PA7},
+        gpiob::PB9,
+        Alternate, Floating, Input, Output, PushPull,
+    },
     pac::SPI1,
     prelude::*,
     rcc::Rcc,
@@ -32,6 +36,8 @@ type CsPin = PA4<Output<PushPull>>;
 type DcPin = PA2<Output<PushPull>>;
 // 复位引脚类型，PA3作为输出推挽
 type RstPin = PA3<Output<PushPull>>;
+// 背光引脚类型，PB9作为输出推挽
+type BacklightPin = PB9<Output<PushPull>>;
 
 /// 配置好的ST7735显示屏类型别名
 pub type Display = ST7735<SpiDeviceWithCs<SpiBusType, CsPin>, DcPin, RstPin>;
@@ -39,24 +45,22 @@ pub type Display = ST7735<SpiDeviceWithCs<SpiBusType, CsPin>, DcPin, RstPin>;
 /// 初始化连接到GPIOA的SPI1的LCD显示屏
 pub fn init<DELAY>(
     spi_peripheral: SPI1,
-    mut gpioa: gpioa::Parts,
+    sck: PA5<Alternate<PushPull>>,
+    mosi: PA7<Alternate<PushPull>>,
+    mut cs: CsPin,
+    dc: DcPin,
+    rst: RstPin,
+    mut backlight: BacklightPin,
     rcc: &mut Rcc,
     delay: &mut DELAY,
-) -> Result<Display, ()>
+) -> Result<(Display, BacklightPin), ()>
 where
     DELAY: DelayNs,
 {
-    // 配置SPI引脚：SCK时钟引脚PA5，MOSI数据输出引脚PA7
-    let sck = gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl);
-    let mosi = gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl);
-
-    // 控制引脚：CS片选PA4，DC数据/命令选择PA2，RST复位PA3
-    let mut cs = gpioa.pa4.into_push_pull_output(&mut gpioa.crl);
-    let dc = gpioa.pa2.into_push_pull_output(&mut gpioa.crl);
-    let rst = gpioa.pa3.into_push_pull_output(&mut gpioa.crl);
-
     // 在交给SPI设备包装器之前，将片选引脚置高空闲
     let _ = cs.set_high();
+    // 初始化阶段先关闭背光，避免亮屏闪烁
+    let _ = backlight.set_low();
 
     // 初始化SPI总线，配置引脚、模式、频率等
     let spi = spi_peripheral.spi(
@@ -81,8 +85,10 @@ where
     let _ = display.set_orientation(&Orientation::Portrait);
     // 设置显示偏移
     display.set_offset(0, 0);
+    // 初始化完成后打开背光
+    let _ = backlight.set_high();
 
-    Ok(display)
+    Ok((display, backlight))
 }
 
 /// 简化的SpiDevice实现，手动管理CS片选引脚

@@ -217,6 +217,7 @@ dependencies = [
  "defmt-rtt",
  "embedded-graphics",
  "embedded-hal 1.0.0",
+ "heapless",
  "panic-probe",
  "st7735-lcd",
  "stm32f1xx-hal",
