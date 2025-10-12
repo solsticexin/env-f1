@@ -1,9 +1,7 @@
-//! DHT11 temperature and humidity sensor driver.
+//! DHT11 温湿度传感器驱动。
 //!
-//! This module provides a minimal blocking driver for reading measurements
-//! from a single-wire DHT11 sensor using a GPIO configured as open-drain.
-//! Timing is implemented with a [`DelayNs`] provider, which is typically the
-//! SysTick-based delay from the HAL.
+//! 本模块提供一个最小的阻塞式驱动，用于通过配置为开漏的 GPIO 从单线 DHT11 传感器读取测量值。
+//! 时序由实现了 [`DelayNs`] 的延时提供者完成，通常使用 HAL 中基于 SysTick 的延时实现。
 
 use core::convert::Infallible;
 
@@ -12,30 +10,29 @@ use embedded_hal::{
     digital::{InputPin, OutputPin},
 };
 
-/// Possible errors returned when querying the DHT11 sensor.
+/// 查询 DHT11 传感器时可能返回的错误类型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error<PinError = Infallible> {
-    /// The sensor did not respond within the expected timing window.
+    /// 传感器在期望的时序窗口内没有响应（超时）。
     Timeout,
-    /// The received data failed the checksum validation step.
+    /// 接收到的数据校验和验证失败。
     Checksum,
-    /// GPIO access failed.
+    /// 对 GPIO 的访问失败（引脚操作错误）。
     Pin(PinError),
 }
 
-/// A single DHT11 measurement expressed in tenths.
+/// 单次 DHT11 测量值，单位为十分之一。
 ///
-/// The integer value is stored in tenths to avoid using floating point while
-/// still exposing the decimal digit reported by the sensor.
+/// 使用整数的十分之一表示法以避免浮点运算，同时保留传感器报出的个位小数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reading {
-    /// Relative humidity in tenths of a percent.
+    /// 相对湿度，单位为百分比的十分之一（tenths）。
     pub humidity_tenths: u16,
-    /// Temperature in tenths of a °C.
+    /// 温度，单位为摄氏度的十分之一（tenths）。
     pub temperature_tenths: u16,
 }
 
-/// Blocking DHT11 driver.
+/// 阻塞式 DHT11 驱动。
 pub struct Dht11<P> {
     pin: P,
 }
@@ -44,14 +41,14 @@ impl<P, PinError> Dht11<P>
 where
     P: OutputPin<Error = PinError> + InputPin<Error = PinError>,
 {
-    /// Create a new driver from an open-drain GPIO pin.
+    /// 使用开漏 GPIO 引脚创建新的驱动实例。
     pub fn new(mut pin: P) -> Result<Self, PinError> {
-        // Ensure the line is idle-high before the first request.
+        // 在第一次请求之前确保数据线处于空闲高电平。
         pin.set_high()?;
         Ok(Self { pin })
     }
 
-    /// Read a single measurement from the sensor.
+    /// 从传感器读取一次测量值（阻塞）。
     pub fn read<DELAY>(&mut self, delay: &mut DELAY) -> Result<Reading, Error<PinError>>
     where
         DELAY: DelayNs,
@@ -64,11 +61,11 @@ where
         for byte in data.iter_mut() {
             let mut value = 0u8;
             for _ in 0..8 {
-                value <<= 1;
+                value <<= 1; //左移一位
 
-                // Each bit starts with the sensor pulling the line low (~50 µs).
+                // 每一位以传感器将数据线拉低开始（约 50 µs）。
                 self.wait_for_level(delay, false, 70)?;
-                // Followed by a high level: ~26 µs for '0', ~70 µs for '1'.
+                // 随后是高电平：约 26 µs 表示 '0'，约 70 µs 表示 '1'。
                 self.wait_for_level(delay, true, 70)?;
 
                 let mut high_time = 0u32;
@@ -80,7 +77,8 @@ where
                     }
                 }
 
-                if high_time > 40 {
+                // 根据高电平持续时间阈值判断位值（阈值在此处使用 40 µs）。
+                if high_time > 50 {
                     value |= 1;
                 }
             }
@@ -95,13 +93,18 @@ where
             return Err(Error::Checksum);
         }
 
-        // 添加调试输出
-        defmt::info!("DHT11 raw data: {} {} {} {} {}", data[0], data[1], data[2], data[3], data[4]);
+        // 添加调试输出（方便在 defmt 日志中查看原始字节）
+        defmt::info!(
+            "DHT11 raw data: {} {} {} {} {}",
+            data[0],
+            data[1],
+            data[2],
+            data[3],
+            data[4]
+        );
 
-        let humidity_tenths =
-            u16::from(data[0]) * 10 + u16::from(data[1]);
-        let temperature_tenths =
-            u16::from(data[2]) * 10 + u16::from(data[3]);
+        let humidity_tenths = u16::from(data[0]) * 10 + u16::from(data[1]);
+        let temperature_tenths = u16::from(data[2]) * 10 + u16::from(data[3]);
 
         Ok(Reading {
             humidity_tenths,
@@ -113,6 +116,7 @@ where
     where
         DELAY: DelayNs,
     {
+        // 主机拉低数据线至少 18ms（此处使用 20ms），作为启动信号，然后拉高并等待传感器准备。
         self.pin.set_low().map_err(Error::Pin)?;
         delay.delay_ms(20_u32);
         self.pin.set_high().map_err(Error::Pin)?;
@@ -120,14 +124,11 @@ where
         Ok(())
     }
 
-    fn await_sensor_response<DELAY>(
-        &mut self,
-        delay: &mut DELAY,
-    ) -> Result<(), Error<PinError>>
+    fn await_sensor_response<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), Error<PinError>>
     where
         DELAY: DelayNs,
     {
-        // Sensor pulls the line low (~80 µs), high (~80 µs), then low
+        // 传感器响应阶段：先拉低（约 80 µs），再拉高（约 80 µs），然后再次拉低，随后开始发送数据位。
         self.wait_for_level(delay, false, 120)?;
         self.wait_for_level(delay, true, 120)?;
         self.wait_for_level(delay, false, 120)?;
@@ -148,8 +149,10 @@ where
             if is_high == level_high {
                 return Ok(());
             }
+            // 每次循环等待 1 µs，总共最多等待 timeout_us 微秒。
             delay.delay_us(1_u32);
         }
+        // 超时未达到期望电平
         Err(Error::Timeout)
     }
 }

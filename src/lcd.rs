@@ -18,9 +18,9 @@ use embedded_hal::{
 use st7735_lcd::{Orientation, ST7735};
 use stm32f1xx_hal::{
     gpio::{
+        Alternate, Floating, Input, Output, PushPull,
         gpioa::{PA2, PA3, PA4, PA5, PA7},
         gpiob::PB9,
-        Alternate, Floating, Input, Output, PushPull,
     },
     pac::SPI1,
     prelude::*,
@@ -81,8 +81,8 @@ where
     let mut display = ST7735::new(spi_device, dc, rst, true, false, 128, 160);
     // 初始化显示屏硬件
     display.init(delay)?;
-    // 设置显示方向为纵向
-    let _ = display.set_orientation(&Orientation::Portrait);
+    // 设置显示方向为横向，长边水平显示
+    let _ = display.set_orientation(&Orientation::Landscape);
     // 设置显示偏移
     display.set_offset(0, 0);
     // 初始化完成后打开背光
@@ -147,11 +147,11 @@ where
         let result = (|| -> Result<(), SPI::Error> {
             for operation in operations.iter_mut() {
                 match operation {
-                    Operation::Read(buffer) => self.spi.read(buffer)?,  // 读取数据到缓冲区
-                    Operation::Write(buffer) => self.spi.write(buffer)?,  // 写入缓冲区数据
-                    Operation::Transfer(read, write) => self.spi.transfer(read, write)?,  // 同时读写
-                    Operation::TransferInPlace(buffer) => self.spi.transfer_in_place(buffer)?,  // 原地传输
-                    Operation::DelayNs(delay_ns) => busy_wait_ns(*delay_ns),  // 软件延时
+                    Operation::Read(buffer) => self.spi.read(buffer)?, // 读取数据到缓冲区
+                    Operation::Write(buffer) => self.spi.write(buffer)?, // 写入缓冲区数据
+                    Operation::Transfer(read, write) => self.spi.transfer(read, write)?, // 同时读写
+                    Operation::TransferInPlace(buffer) => self.spi.transfer_in_place(buffer)?, // 原地传输
+                    Operation::DelayNs(delay_ns) => busy_wait_ns(*delay_ns), // 软件延时
                 }
             }
             // 刷新SPI总线，确保所有数据发送完成

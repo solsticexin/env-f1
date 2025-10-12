@@ -7,7 +7,7 @@
 use nb::block;
 use stm32f1xx_hal::{
     adc::{Adc, SampleTime},
-    gpio::{gpioa::PA0, Analog},
+    gpio::{Analog, gpioa::PA0},
     hal_02::adc::OneShot,
     pac,
 };
