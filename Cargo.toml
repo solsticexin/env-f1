@@ -24,6 +24,7 @@ features = ["stm32f103", ]
 name = "env-f1"
 test = false
 
+
 # Set the default for dependencies.
 [profile.dev.package."*"]
 opt-level = "s"

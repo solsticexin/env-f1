@@ -14,6 +14,7 @@ mod dh11;
 mod lcd;
 mod light_sensor;
 mod soil_sensor;
+mod json_payload;
 
 // Cortex-M 运行时入口点
 use cortex_m_rt::entry;
@@ -22,13 +23,14 @@ use core::fmt::Write;
 use defmt::{info, warn};
 use dh11::{Dht11, Error as DhtError};
 use embedded_graphics::{
-    image::{Image, ImageRawLE},
+    draw_target::DrawTarget,
     mono_font::{
+        ascii::{FONT_6X12, FONT_6X13_BOLD},
         MonoTextStyleBuilder,
-        ascii::{FONT_9X15, FONT_9X15_BOLD},
     },
-    pixelcolor::Rgb565,
+    pixelcolor::{raw::RawU16, Rgb565},
     prelude::*,
+    primitives::{PrimitiveStyleBuilder, Rectangle},
     text::Text,
 };
 use embedded_hal::delay::DelayNs;
@@ -36,6 +38,7 @@ use heapless::String;
 use light_sensor::Bh1750;
 use soil_sensor::SoilSensor;
 // STM32F1xx HAL 库
+use json_payload::{Error as PayloadError, JsonPayload, TelemetryFrame};
 use stm32f1xx_hal::{
     adc::AdcExt,
     afio::AfioExt,
@@ -44,6 +47,7 @@ use stm32f1xx_hal::{
     pac,
     prelude::*,
     rcc,
+    serial::{Config as SerialConfig, SerialExt},
     spi::{Mode as SpiMode, Phase, Polarity},
 };
 // SPI 模式配置：空闲时钟低电平，第一个时钟边沿捕获
@@ -51,6 +55,46 @@ pub(crate) const SPI_MODE: SpiMode = SpiMode {
     polarity: Polarity::IdleLow,
     phase: Phase::CaptureOnFirstTransition,
 };
+
+const BACKGROUND_WIDTH: u32 = 120;
+const BACKGROUND_HEIGHT: u32 = 96;
+const BACKGROUND_SCALE: u32 = 1;
+const ESP_IP: &str = "192.168.114.157";
+
+fn draw_scaled_rgb565_image<D>(
+    display: &mut D,
+    origin: Point,
+    raw: &[u8],
+    src_width: u32,
+    src_height: u32,
+    scale: u32,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if scale == 0 {
+        return Ok(());
+    }
+
+    let scaled_width = src_width / scale;
+    let scaled_height = src_height / scale;
+
+    for y in 0..scaled_height {
+        let src_y = y * scale;
+        for x in 0..scaled_width {
+            let src_x = x * scale;
+            let index = ((src_y * src_width + src_x) * 2) as usize;
+            if index + 1 >= raw.len() {
+                continue;
+            }
+            let pixel = u16::from_le_bytes([raw[index], raw[index + 1]]);
+            let color = Rgb565::from(RawU16::new(pixel));
+            Pixel(origin + Point::new(x as i32, y as i32), color).draw(display)?;
+        }
+    }
+
+    Ok(())
+}
 
 // 程序入口点
 #[entry]
@@ -65,7 +109,7 @@ fn main() -> ! {
     let mut rcc = dp.RCC.constrain();
     let _afio = dp.AFIO.constrain(&mut rcc);
     rcc = rcc.freeze(
-        rcc::Config::hse(8.MHz()).sysclk(48.MHz()).pclk1(24.MHz()),
+        rcc::Config::hse(8.MHz()).sysclk(72.MHz()).pclk1(36.MHz()),
         &mut flash.acr,
     );
     // 开启 DWT 周期计数器以支持 I2C 阻塞实现的超时
@@ -77,6 +121,19 @@ fn main() -> ! {
     // 配置 GPIOA / GPIOB
     let mut gpioa = dp.GPIOA.split(&mut rcc);
     let mut gpiob = dp.GPIOB.split(&mut rcc);
+
+    // 配置 USART1：PA9 (TX), PA10 (RX)
+    let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
+    let rx_pin = gpioa.pa10;
+    let serial = dp
+        .USART1
+        .serial(
+            (tx_pin, rx_pin),
+            SerialConfig::default().baudrate(115_200.bps()),
+            &mut rcc,
+        );
+    let (tx, _rx) = serial.split();
+    let mut json_payload = JsonPayload::new(tx);
 
     // 配置 I2C1：PB6 (SCL), PB7 (SDA)
     let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
@@ -122,7 +179,7 @@ fn main() -> ! {
     // buzzer.set_low();
 
     // DHT11 初始化后延迟 2 秒
-    DelayNs::delay_ms(&mut delay, 3_500_u32);
+    // DelayNs::delay_ms(&mut delay, 2_000_u32);
 
     // 背光引脚 PB9
     let backlight_pin = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
@@ -146,19 +203,22 @@ fn main() -> ! {
     display.clear(Rgb565::BLACK).unwrap();
 
     let label_text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_9X15)
+        .font(&FONT_6X12)
         .text_color(Rgb565::WHITE)
         .build();
     let value_text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_9X15_BOLD)
+        .font(&FONT_6X13_BOLD)
         .text_color(Rgb565::YELLOW)
         .build();
-    let background_raw = ImageRawLE::new(
-        include_bytes!("../assets/images/status_background.rgb565"),
-        120,
-    );
-    let background_origin = Point::new(0, 16);
-    let background_image = Image::new(&background_raw, background_origin);
+    let ip_text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X13_BOLD)
+        .text_color(Rgb565::CYAN)
+        .build();
+    let background_bytes = include_bytes!("../assets/images/status_background.rgb565");
+    let background_origin = Point::new(8, 28);
+    let value_text_origin = Point::new(92, 55);
+    let ip_text_origin = Point::new(8, 18);
+    let scaled_background_height = BACKGROUND_HEIGHT / BACKGROUND_SCALE;
 
     // 主循环：每隔 5 秒读取一次温湿度并刷新显示
     loop {
@@ -170,6 +230,7 @@ fn main() -> ! {
         // 翻转蜂鸣器
         // buzzer.toggle();
         // DelayNs::delay_ms(&mut delay, 5_000_u32);
+        let mut telemetry = TelemetryFrame::default();
         let mut soil_value: String<16> = String::new();
         let mut light_value: String<16> = String::new();
 
@@ -177,6 +238,7 @@ fn main() -> ! {
             Ok(raw_value) => {
                 let percent = SoilSensor::raw_to_percent(raw_value);
                 let _ = write!(soil_value, "{}%", percent);
+                telemetry.sensors.soil_pct = Some(percent);
                 info!("Soil moisture: raw {} counts (~{}%)", raw_value, percent);
             }
             Err(_) => {
@@ -190,6 +252,7 @@ fn main() -> ! {
                 let lux_int = lux_tenths / 10;
                 let lux_dec = lux_tenths % 10;
                 let _ = write!(light_value, "{}.{}lx", lux_int, lux_dec);
+                telemetry.sensors.lux_tenths = Some(lux_tenths);
                 info!("BH1750: {}.{} lux", lux_int, lux_dec);
             }
             Err(_) => {
@@ -211,6 +274,9 @@ fn main() -> ! {
 
                 let _ = write!(temp_value, "{}.{}℃", temp_int, temp_dec);
                 let _ = write!(hum_value, "{}.{}%", hum_int, hum_dec);
+                telemetry.sensors.temperature_tenths_c =
+                    Some(reading.temperature_tenths as i16);
+                telemetry.sensors.humidity_tenths_pct = Some(reading.humidity_tenths);
                 info!(
                     "DHT11: temp {}.{} C, humidity {}.{} %",
                     temp_int, temp_dec, hum_int, hum_dec
@@ -228,7 +294,30 @@ fn main() -> ! {
             }
         }
 
-        background_image.draw(&mut display).unwrap();
+        let clear_top = (background_origin.y - 8).max(0);
+        let clear_height = (scaled_background_height + 16).min(128);
+        Rectangle::new(Point::new(0, clear_top), Size::new(160, clear_height))
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .fill_color(Rgb565::BLACK)
+                    .build(),
+            )
+            .draw(&mut display)
+            .unwrap();
+
+        draw_scaled_rgb565_image(
+            &mut display,
+            background_origin,
+            background_bytes,
+            BACKGROUND_WIDTH,
+            BACKGROUND_HEIGHT,
+            BACKGROUND_SCALE,
+        )
+        .unwrap();
+
+        Text::new(ESP_IP, ip_text_origin, ip_text_style)
+            .draw(&mut display)
+            .unwrap();
 
         let value_texts = [
             temp_value.as_str(),
@@ -237,8 +326,8 @@ fn main() -> ! {
             soil_value.as_str(),
         ];
         for (index, text) in value_texts.iter().enumerate() {
-            let offset = Point::new(80, 30 + (index as i32) * 20);
-            Text::new(*text, background_origin + offset, value_text_style)
+            let offset = Point::new(0, (index as i32) * 21);
+            Text::new(*text, value_text_origin + offset, value_text_style)
                 .draw(&mut display)
                 .unwrap();
         }
@@ -246,11 +335,21 @@ fn main() -> ! {
         if let Some(status) = status_line {
             Text::new(
                 status,
-                background_origin + Point::new(0, -16),
+                background_origin + Point::new(0, -10),
                 label_text_style,
             )
             .draw(&mut display)
             .unwrap();
+        }
+
+        if let Err(error) = json_payload.send_data(&telemetry) {
+            match error {
+                PayloadError::BufferOverflow => warn!("Telemetry buffer overflow"),
+                PayloadError::Serial(serial_err) => {
+                    let _ = serial_err;
+                    warn!("Telemetry UART error")
+                }
+            }
         }
 
         DelayNs::delay_ms(&mut delay, 5_000_u32);

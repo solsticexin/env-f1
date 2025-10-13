@@ -78,7 +78,8 @@ where
     let spi_device = SpiDeviceWithCs::new(spi, cs);
 
     // 创建ST7735显示屏实例，参数：SPI设备、DC、RST、RGB顺序、反转行、宽度、高度
-    let mut display = ST7735::new(spi_device, dc, rst, true, false, 128, 160);
+    // 准备以横屏模式使用，宽度为 160，高度为 128
+    let mut display = ST7735::new(spi_device, dc, rst, true, false, 160, 128);
     // 初始化显示屏硬件
     display.init(delay)?;
     // 设置显示方向为横向，长边水平显示
