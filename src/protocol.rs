@@ -1,7 +1,7 @@
 //! JSON payload helpers for the Bonsai care monitoring system communication
 //! protocol.
 //!
-//! According to `智能盆栽系统通信协议与控制规范.md`, the STM32 firmware must emit
+//! According to `智能盆栽系统通信协议.md`, the STM32 firmware must emit
 //! newline-delimited JSON (NDJSON) messages with the following schemas:
 //! * `type: "data"`  — telemetry upload towards the ESP-01S / web UI
 //! * `type: "ack"`   — execution acknowledgement after handling a command
@@ -12,6 +12,7 @@ use core::fmt::Write as _;
 
 use heapless::String;
 use nb::block;
+use serde::Deserialize;
 use stm32f1xx_hal::serial::{Error as SerialError, Instance, Tx};
 
 /// Maximum length of a single telemetry (`type: data`) JSON line, including the
@@ -25,13 +26,13 @@ const ACK_BUF_CAPACITY: usize = 96;
 macro_rules! pushf {
     ($buffer:expr, $($arg:tt)*) => {
         if write!($buffer, $($arg)*).is_err() {
-            return Err(Error::BufferOverflow);
+            return Err(ProtocolError::BufferOverflow);
         }
     };
 }
 
 /// Error type returned when building or transmitting a JSON payload fails.
-pub enum Error {
+pub enum ProtocolError {
     /// Formatting the JSON string overflowed the fixed buffer.
     BufferOverflow,
     /// Underlying UART write operation failed.
@@ -68,6 +69,7 @@ pub struct ActuatorSnapshot {
     pub water_on: bool,
     pub light_on: bool,
     pub fan_on: bool,
+    pub buzzer_on: bool,
 }
 
 impl Default for ActuatorSnapshot {
@@ -76,6 +78,7 @@ impl Default for ActuatorSnapshot {
             water_on: false,
             light_on: false,
             fan_on: false,
+            buzzer_on: false,
         }
     }
 }
@@ -95,14 +98,16 @@ pub enum CommandTarget {
     Water,
     Light,
     Fan,
+    Buzzer,
 }
 
 impl CommandTarget {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             CommandTarget::Water => "water",
             CommandTarget::Light => "light",
             CommandTarget::Fan => "fan",
+            CommandTarget::Buzzer => "buzzer",
         }
     }
 }
@@ -117,7 +122,7 @@ pub enum CommandAction {
 }
 
 impl CommandAction {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             CommandAction::On => "on",
             CommandAction::Off => "off",
@@ -153,18 +158,18 @@ pub struct AckFrame {
 }
 
 /// Stateful JSON payload emitter that streams frames to the provided UART TX.
-pub struct JsonPayload<USART: Instance> {
+pub struct ProtocolLink<USART: Instance> {
     tx: Tx<USART>,
 }
 
-impl<USART: Instance> JsonPayload<USART> {
+impl<USART: Instance> ProtocolLink<USART> {
     /// Create a new payload emitter with the provided UART transmitter.
     pub fn new(tx: Tx<USART>) -> Self {
         Self { tx }
     }
 
     /// Emit a `type: "data"` JSON line that follows the communication protocol.
-    pub fn send_data(&mut self, frame: &TelemetryFrame) -> Result<(), Error> {
+    pub fn send_data(&mut self, frame: &TelemetryFrame) -> Result<(), ProtocolError> {
         let mut payload: String<DATA_BUF_CAPACITY> = String::new();
 
         pushf!(payload, "{{\"type\":\"data\"");
@@ -213,6 +218,12 @@ impl<USART: Instance> JsonPayload<USART> {
             bool_to_bit(frame.actuators.fan_on)
         );
 
+        pushf!(
+            payload,
+            ",\"buzzer\":{}",
+            bool_to_bit(frame.actuators.buzzer_on)
+        );
+
         // Close the object and append newline for NDJSON framing.
         pushf!(payload, "}}\n");
 
@@ -221,7 +232,7 @@ impl<USART: Instance> JsonPayload<USART> {
 
     /// Emit a `type: "ack"` JSON line to report command execution result.
     #[allow(dead_code)]
-    pub fn send_ack(&mut self, ack: AckFrame) -> Result<(), Error> {
+    pub fn send_ack(&mut self, ack: AckFrame) -> Result<(), ProtocolError> {
         let mut payload: String<ACK_BUF_CAPACITY> = String::new();
         pushf!(
             payload,
@@ -233,11 +244,11 @@ impl<USART: Instance> JsonPayload<USART> {
         self.flush_bytes(payload.as_bytes())
     }
 
-    fn flush_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    fn flush_bytes(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
         for &byte in bytes {
-            block!(self.tx.write_u8(byte)).map_err(Error::Serial)?;
+            block!(self.tx.write_u8(byte)).map_err(ProtocolError::Serial)?;
         }
-        block!(self.tx.flush()).map_err(Error::Serial)?;
+        block!(self.tx.flush()).map_err(ProtocolError::Serial)?;
         Ok(())
     }
 }
@@ -249,4 +260,79 @@ const fn bool_to_bit(value: bool) -> u8 {
     } else {
         0
     }
+}
+
+/// Parsed representation of a `type: "cmd"` payload.
+pub struct CommandFrame {
+    pub target: CommandTarget,
+    pub action: CommandAction,
+    /// Pulse duration in milliseconds when the action is `CommandAction::Pulse`.
+    pub pulse_ms: Option<u32>,
+}
+
+/// Errors that can occur when parsing a command payload.
+pub enum CommandParseError {
+    /// JSON structure is syntactically invalid.
+    Json,
+    /// The frame `type` field is missing or not equal to `"cmd"`.
+    UnexpectedType,
+    /// The command references an unsupported `target`.
+    UnknownTarget,
+    /// The command references an unsupported `action`.
+    UnknownAction,
+    /// A required `time` field is missing for a `pulse` action.
+    MissingPulseDuration,
+}
+
+#[derive(Deserialize)]
+struct RawCommand<'a> {
+    #[serde(rename = "type")]
+    frame_type: &'a str,
+    target: Option<&'a str>,
+    action: Option<&'a str>,
+    #[serde(default)]
+    time: Option<u32>,
+}
+
+/// Parse a JSON line into a [`CommandFrame`].
+pub fn parse_command_frame(line: &[u8]) -> Result<CommandFrame, CommandParseError> {
+    let (raw, _consumed) =
+        serde_json_core::from_slice::<RawCommand>(line).map_err(|_| CommandParseError::Json)?;
+
+    if raw.frame_type != "cmd" {
+        return Err(CommandParseError::UnexpectedType);
+    }
+
+    let target = match raw.target {
+        Some("water") => CommandTarget::Water,
+        Some("light") => CommandTarget::Light,
+        Some("fan") => CommandTarget::Fan,
+        Some("buzzer") => CommandTarget::Buzzer,
+        Some(_) => return Err(CommandParseError::UnknownTarget),
+        None => return Err(CommandParseError::UnknownTarget),
+    };
+
+    let action = match raw.action {
+        Some("on") => CommandAction::On,
+        Some("off") => CommandAction::Off,
+        Some("pulse") => CommandAction::Pulse,
+        Some(_) => return Err(CommandParseError::UnknownAction),
+        None => return Err(CommandParseError::UnknownAction),
+    };
+
+    let pulse_ms = match action {
+        CommandAction::Pulse => Some(
+            raw.time
+                .ok_or(CommandParseError::MissingPulseDuration)?
+                .max(1)
+                .min(10_000),
+        ),
+        _ => None,
+    };
+
+    Ok(CommandFrame {
+        target,
+        action,
+        pulse_ms,
+    })
 }

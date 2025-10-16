@@ -78,7 +78,7 @@ where
                 }
 
                 // 根据高电平持续时间阈值判断位值（阈值在此处使用 40 µs）。
-                if high_time > 50 {
+                if high_time > 30 {
                     value |= 1;
                 }
             }

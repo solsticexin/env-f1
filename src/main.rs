@@ -10,15 +10,17 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 // LCD 模块
+mod actuators;
 mod dh11;
 mod lcd;
 mod light_sensor;
 mod soil_sensor;
-mod json_payload;
+mod protocol;
 
 // Cortex-M 运行时入口点
 use cortex_m_rt::entry;
 // 嵌入式图形库
+use actuators::{ActuatorError, Actuators};
 use core::fmt::Write;
 use defmt::{info, warn};
 use dh11::{Dht11, Error as DhtError};
@@ -37,8 +39,11 @@ use embedded_hal::delay::DelayNs;
 use heapless::String;
 use light_sensor::Bh1750;
 use soil_sensor::SoilSensor;
+use nb::Error as NbError;
 // STM32F1xx HAL 库
-use json_payload::{Error as PayloadError, JsonPayload, TelemetryFrame};
+use protocol::{
+    AckFrame, AckResult, CommandParseError, ProtocolError, ProtocolLink, TelemetryFrame,
+};
 use stm32f1xx_hal::{
     adc::AdcExt,
     afio::AfioExt,
@@ -47,7 +52,7 @@ use stm32f1xx_hal::{
     pac,
     prelude::*,
     rcc,
-    serial::{Config as SerialConfig, SerialExt},
+    serial::{Config as SerialConfig, Instance, SerialExt},
     spi::{Mode as SpiMode, Phase, Polarity},
 };
 // SPI 模式配置：空闲时钟低电平，第一个时钟边沿捕获
@@ -59,7 +64,7 @@ pub(crate) const SPI_MODE: SpiMode = SpiMode {
 const BACKGROUND_WIDTH: u32 = 120;
 const BACKGROUND_HEIGHT: u32 = 96;
 const BACKGROUND_SCALE: u32 = 1;
-const ESP_IP: &str = "192.168.114.157";
+const ESP_IP: &str = "192.168.4.1";
 
 fn draw_scaled_rgb565_image<D>(
     display: &mut D,
@@ -122,6 +127,12 @@ fn main() -> ! {
     let mut gpioa = dp.GPIOA.split(&mut rcc);
     let mut gpiob = dp.GPIOB.split(&mut rcc);
 
+    // 配置继电器与蜂鸣器输出引脚
+    let water_pin = gpiob.pb0.into_push_pull_output(&mut gpiob.crl);
+    let light_pin = gpiob.pb1.into_push_pull_output(&mut gpiob.crl);
+    let fan_pin = gpiob.pb10.into_push_pull_output(&mut gpiob.crh);
+    let buzzer_pin = gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
+
     // 配置 USART1：PA9 (TX), PA10 (RX)
     let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
     let rx_pin = gpioa.pa10;
@@ -132,8 +143,9 @@ fn main() -> ! {
             SerialConfig::default().baudrate(115_200.bps()),
             &mut rcc,
         );
-    let (tx, _rx) = serial.split();
-    let mut json_payload = JsonPayload::new(tx);
+    let (tx, mut rx) = serial.split();
+    let mut protocol_link = ProtocolLink::new(tx);
+    let mut actuators = Actuators::new(water_pin, light_pin, fan_pin, buzzer_pin);
 
     // 配置 I2C1：PB6 (SCL), PB7 (SDA)
     let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
@@ -220,138 +232,218 @@ fn main() -> ! {
     let ip_text_origin = Point::new(8, 18);
     let scaled_background_height = BACKGROUND_HEIGHT / BACKGROUND_SCALE;
 
-    // 主循环：每隔 5 秒读取一次温湿度并刷新显示
+    const TICK_MS: u32 = 100;
+    const SAMPLE_PERIOD_MS: u32 = 5_000;
+    let mut command_buffer: String<256> = String::new();
+    let mut elapsed_ms: u32 = SAMPLE_PERIOD_MS;
+
+    // 主循环：定时采集数据，并在空闲时处理控制命令
     loop {
-        // 测试用的 1 秒节拍，累计 5 秒刷新一次
-        // for _ in 0..5 {
-        //     defmt::info!("Waiting 1s...");
-        //     DelayNs::delay_ms(&mut delay, 1_000_u32);
-        // }
-        // 翻转蜂鸣器
-        // buzzer.toggle();
-        // DelayNs::delay_ms(&mut delay, 5_000_u32);
-        let mut telemetry = TelemetryFrame::default();
-        let mut soil_value: String<16> = String::new();
-        let mut light_value: String<16> = String::new();
-
-        match soil_sensor.read_raw() {
-            Ok(raw_value) => {
-                let percent = SoilSensor::raw_to_percent(raw_value);
-                let _ = write!(soil_value, "{}%", percent);
-                telemetry.sensors.soil_pct = Some(percent);
-                info!("Soil moisture: raw {} counts (~{}%)", raw_value, percent);
-            }
-            Err(_) => {
-                let _ = soil_value.push_str("--");
-                warn!("Soil sensor read error");
-            }
-        }
-
-        match light_sensor.read_lux_tenths(&mut delay) {
-            Ok(lux_tenths) => {
-                let lux_int = lux_tenths / 10;
-                let lux_dec = lux_tenths % 10;
-                let _ = write!(light_value, "{}.{}lx", lux_int, lux_dec);
-                telemetry.sensors.lux_tenths = Some(lux_tenths);
-                info!("BH1750: {}.{} lux", lux_int, lux_dec);
-            }
-            Err(_) => {
-                let _ = light_value.push_str("--");
-                warn!("BH1750 read error");
-            }
-        }
-
-        let mut temp_value: String<16> = String::new();
-        let mut hum_value: String<16> = String::new();
-        let mut status_line: Option<&'static str> = None;
-
-        match dht11.read(&mut delay) {
-            Ok(reading) => {
-                let temp_int = reading.temperature_tenths / 10;
-                let temp_dec = reading.temperature_tenths % 10;
-                let hum_int = reading.humidity_tenths / 10;
-                let hum_dec = reading.humidity_tenths % 10;
-
-                let _ = write!(temp_value, "{}.{}℃", temp_int, temp_dec);
-                let _ = write!(hum_value, "{}.{}%", hum_int, hum_dec);
-                telemetry.sensors.temperature_tenths_c =
-                    Some(reading.temperature_tenths as i16);
-                telemetry.sensors.humidity_tenths_pct = Some(reading.humidity_tenths);
-                info!(
-                    "DHT11: temp {}.{} C, humidity {}.{} %",
-                    temp_int, temp_dec, hum_int, hum_dec
-                );
-            }
-            Err(error) => {
-                let _ = temp_value.push_str("--");
-                let _ = hum_value.push_str("--");
-                status_line = Some("DHT11 ERR");
-                match error {
-                    DhtError::Timeout => warn!("DHT11 timeout"),
-                    DhtError::Checksum => warn!("DHT11 checksum mismatch"),
-                    DhtError::Pin(_) => warn!("DHT11 pin error"),
+        // 处理来自 ESP 的命令
+        loop {
+            match rx.read() {
+                Ok(byte) => {
+                    if byte == b'\n' {
+                        if let Some(b'\r') = command_buffer.as_bytes().last() {
+                            let _ = command_buffer.pop();
+                        }
+                        if !command_buffer.is_empty() {
+                            process_command_line(
+                                command_buffer.as_bytes(),
+                                &mut actuators,
+                                &mut protocol_link,
+                                &mut delay,
+                            );
+                        }
+                        command_buffer.clear();
+                    } else if byte == b'\r' {
+                        // 忽略 CR
+                    } else if command_buffer.push(byte as char).is_err() {
+                        warn!("Command line overflow, clearing buffer");
+                        command_buffer.clear();
+                    }
+                }
+                Err(NbError::WouldBlock) => break,
+                Err(NbError::Other(_)) => {
+                    warn!("UART RX error");
+                    break;
                 }
             }
         }
 
-        let clear_top = (background_origin.y - 8).max(0);
-        let clear_height = (scaled_background_height + 16).min(128);
-        Rectangle::new(Point::new(0, clear_top), Size::new(160, clear_height))
-            .into_styled(
-                PrimitiveStyleBuilder::new()
-                    .fill_color(Rgb565::BLACK)
-                    .build(),
-            )
-            .draw(&mut display)
-            .unwrap();
+        if elapsed_ms >= SAMPLE_PERIOD_MS {
+            elapsed_ms = 0;
+            let mut telemetry = TelemetryFrame::default();
+            let mut soil_value: String<16> = String::new();
+            let mut light_value: String<16> = String::new();
 
-        draw_scaled_rgb565_image(
-            &mut display,
-            background_origin,
-            background_bytes,
-            BACKGROUND_WIDTH,
-            BACKGROUND_HEIGHT,
-            BACKGROUND_SCALE,
-        )
-        .unwrap();
+            match soil_sensor.read_raw() {
+                Ok(raw_value) => {
+                    let percent = SoilSensor::raw_to_percent(raw_value);
+                    let _ = write!(soil_value, "{}%", percent);
+                    telemetry.sensors.soil_pct = Some(percent);
+                    info!("Soil moisture: raw {} counts (~{}%)", raw_value, percent);
+                }
+                Err(_) => {
+                    let _ = soil_value.push_str("--");
+                    warn!("Soil sensor read error");
+                }
+            }
 
-        Text::new(ESP_IP, ip_text_origin, ip_text_style)
-            .draw(&mut display)
-            .unwrap();
+            match light_sensor.read_lux_tenths(&mut delay) {
+                Ok(lux_tenths) => {
+                    let lux_int = lux_tenths / 10;
+                    let lux_dec = lux_tenths % 10;
+                    let _ = write!(light_value, "{}.{}lx", lux_int, lux_dec);
+                    telemetry.sensors.lux_tenths = Some(lux_tenths);
+                    info!("BH1750: {}.{} lux", lux_int, lux_dec);
+                }
+                Err(_) => {
+                    let _ = light_value.push_str("--");
+                    warn!("BH1750 read error");
+                }
+            }
 
-        let value_texts = [
-            temp_value.as_str(),
-            hum_value.as_str(),
-            light_value.as_str(),
-            soil_value.as_str(),
-        ];
-        for (index, text) in value_texts.iter().enumerate() {
-            let offset = Point::new(0, (index as i32) * 21);
-            Text::new(*text, value_text_origin + offset, value_text_style)
+            let mut temp_value: String<16> = String::new();
+            let mut hum_value: String<16> = String::new();
+            let mut status_line: Option<&'static str> = None;
+
+            match dht11.read(&mut delay) {
+                Ok(reading) => {
+                    let temp_int = reading.temperature_tenths / 10;
+                    let temp_dec = reading.temperature_tenths % 10;
+                    let hum_int = reading.humidity_tenths / 10;
+                    let hum_dec = reading.humidity_tenths % 10;
+
+                    let _ = write!(temp_value, "{}.{}℃", temp_int, temp_dec);
+                    let _ = write!(hum_value, "{}.{}%", hum_int, hum_dec);
+                    telemetry.sensors.temperature_tenths_c =
+                        Some(reading.temperature_tenths as i16);
+                    telemetry.sensors.humidity_tenths_pct = Some(reading.humidity_tenths);
+                    info!(
+                        "DHT11: temp {}.{} C, humidity {}.{} %",
+                        temp_int, temp_dec, hum_int, hum_dec
+                    );
+                }
+                Err(error) => {
+                    let _ = temp_value.push_str("--");
+                    let _ = hum_value.push_str("--");
+                    status_line = Some("DHT11 ERR");
+                    match error {
+                        DhtError::Timeout => warn!("DHT11 timeout"),
+                        DhtError::Checksum => warn!("DHT11 checksum mismatch"),
+                        DhtError::Pin(_) => warn!("DHT11 pin error"),
+                    }
+                }
+            }
+
+            telemetry.actuators = actuators.snapshot();
+
+            let clear_top = (background_origin.y - 8).max(0);
+            let clear_height = (scaled_background_height + 16).min(128);
+            Rectangle::new(Point::new(0, clear_top), Size::new(160, clear_height))
+                .into_styled(
+                    PrimitiveStyleBuilder::new()
+                        .fill_color(Rgb565::BLACK)
+                        .build(),
+                )
                 .draw(&mut display)
                 .unwrap();
-        }
 
-        if let Some(status) = status_line {
-            Text::new(
-                status,
-                background_origin + Point::new(0, -10),
-                label_text_style,
+            draw_scaled_rgb565_image(
+                &mut display,
+                background_origin,
+                background_bytes,
+                BACKGROUND_WIDTH,
+                BACKGROUND_HEIGHT,
+                BACKGROUND_SCALE,
             )
-            .draw(&mut display)
             .unwrap();
-        }
 
-        if let Err(error) = json_payload.send_data(&telemetry) {
-            match error {
-                PayloadError::BufferOverflow => warn!("Telemetry buffer overflow"),
-                PayloadError::Serial(serial_err) => {
-                    let _ = serial_err;
-                    warn!("Telemetry UART error")
+            Text::new(ESP_IP, ip_text_origin, ip_text_style)
+                .draw(&mut display)
+                .unwrap();
+
+            let value_texts = [
+                temp_value.as_str(),
+                hum_value.as_str(),
+                light_value.as_str(),
+                soil_value.as_str(),
+            ];
+            for (index, text) in value_texts.iter().enumerate() {
+                let offset = Point::new(0, (index as i32) * 21);
+                Text::new(*text, value_text_origin + offset, value_text_style)
+                    .draw(&mut display)
+                    .unwrap();
+            }
+
+            if let Some(status) = status_line {
+                Text::new(
+                    status,
+                    background_origin + Point::new(0, -10),
+                    label_text_style,
+                )
+                .draw(&mut display)
+                .unwrap();
+            }
+
+            if let Err(error) = protocol_link.send_data(&telemetry) {
+                match error {
+                    ProtocolError::BufferOverflow => warn!("Telemetry buffer overflow"),
+                    ProtocolError::Serial(serial_err) => {
+                        let _ = serial_err;
+                        warn!("Telemetry UART error")
+                    }
                 }
             }
         }
 
-        DelayNs::delay_ms(&mut delay, 5_000_u32);
+        DelayNs::delay_ms(&mut delay, TICK_MS);
+        elapsed_ms = elapsed_ms.saturating_add(TICK_MS);
+    }
+}
+
+fn process_command_line<USART, D>(
+    line: &[u8],
+    actuators: &mut Actuators,
+    protocol_link: &mut ProtocolLink<USART>,
+    delay: &mut D,
+) where
+    USART: Instance,
+    D: DelayNs,
+{
+    match protocol::parse_command_frame(line) {
+        Ok(command) => {
+            let apply_result = actuators.apply_command(&command, delay);
+            let ack_result = if apply_result.is_ok() {
+                AckResult::Ok
+            } else {
+                AckResult::Error
+            };
+
+            if let Err(error) = &apply_result {
+                match error {
+                    ActuatorError::MissingPulseDuration => {
+                        warn!("Pulse duration missing for command")
+                    }
+                }
+            }
+
+            if let Err(error) = protocol_link.send_ack(AckFrame {
+                target: command.target,
+                action: command.action,
+                result: ack_result,
+            }) {
+                match error {
+                    ProtocolError::BufferOverflow => warn!("Ack buffer overflow"),
+                    ProtocolError::Serial(_serial_err) => warn!("Ack UART error"),
+                }
+            }
+        }
+        Err(CommandParseError::Json) => warn!("Invalid JSON received"),
+        Err(CommandParseError::UnexpectedType) => warn!("Ignoring non-command frame"),
+        Err(CommandParseError::UnknownTarget) => warn!("Unknown command target"),
+        Err(CommandParseError::UnknownAction) => warn!("Unknown command action"),
+        Err(CommandParseError::MissingPulseDuration) => warn!("Pulse command missing time field"),
     }
 }
