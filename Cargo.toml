@@ -31,6 +31,11 @@ name="dh11"
 path="src/temporary/dh11_read.rs"
 test=false
 
+[[bin]]
+name="esp"
+path="src/temporary/esp.rs"
+test=false
+
 
 # Set the default for dependencies.
 [profile.dev.package."*"]

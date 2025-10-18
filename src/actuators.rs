@@ -1,16 +1,20 @@
 use core::convert::Infallible;
 
 use defmt::info;
-use embedded_hal::{delay::DelayNs, digital::OutputPin};
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{OutputPin, StatefulOutputPin},
+};
 use stm32f1xx_hal::gpio::{
+    Output, PushPull,
     gpioa::PA1,
     gpiob::{PB0, PB1, PB10},
-    Output, PushPull,
 };
 
 use crate::protocol::{ActuatorSnapshot, CommandAction, CommandFrame, CommandTarget};
 
 /// Maximum pulse duration accepted by the actuators module (in milliseconds).
+#[allow(dead_code)]
 const MAX_PULSE_MS: u32 = 10_000;
 
 /// Control interface that owns all actuator pins and tracks their runtime state.
@@ -19,10 +23,10 @@ pub struct Actuators {
     light: PB1<Output<PushPull>>,
     fan: PB10<Output<PushPull>>,
     buzzer: PA1<Output<PushPull>>,
-    snapshot: ActuatorSnapshot,
 }
 
 /// Errors that can occur while executing a command on the actuators.
+#[allow(dead_code)]
 pub enum ActuatorError {
     MissingPulseDuration,
 }
@@ -45,11 +49,11 @@ impl Actuators {
             light,
             fan,
             buzzer,
-            snapshot: ActuatorSnapshot::default(),
         }
     }
 
-    /// Execute a parsed command and update the cached actuator state.
+    /// Execute a parsed command.
+    #[allow(dead_code)]
     pub fn apply_command<D: DelayNs>(
         &mut self,
         command: &CommandFrame,
@@ -77,28 +81,30 @@ impl Actuators {
         Ok(())
     }
 
-    /// Snapshot of the current actuator states.
-    pub fn snapshot(&self) -> ActuatorSnapshot {
-        self.snapshot
+    /// Snapshot of the current actuator states by sampling the GPIO output levels.
+    pub fn snapshot(&mut self) -> ActuatorSnapshot {
+        ActuatorSnapshot {
+            water_on: read_output(&mut self.water),
+            light_on: read_output(&mut self.light),
+            fan_on: read_output(&mut self.fan),
+            buzzer_on: read_output(&mut self.buzzer),
+        }
     }
 
+    #[allow(dead_code)]
     fn set_target(&mut self, target: CommandTarget, on: bool) {
         match target {
             CommandTarget::Water => {
                 set_output(&mut self.water, on);
-                self.snapshot.water_on = on;
             }
             CommandTarget::Light => {
                 set_output(&mut self.light, on);
-                self.snapshot.light_on = on;
             }
             CommandTarget::Fan => {
                 set_output(&mut self.fan, on);
-                self.snapshot.fan_on = on;
             }
             CommandTarget::Buzzer => {
                 set_output(&mut self.buzzer, on);
-                self.snapshot.buzzer_on = on;
             }
         }
         info!(
@@ -115,4 +121,8 @@ fn set_output(pin: &mut impl OutputPin<Error = Infallible>, on: bool) {
     } else {
         let _ = pin.set_low();
     }
+}
+
+fn read_output(pin: &mut impl StatefulOutputPin<Error = Infallible>) -> bool {
+    pin.is_set_high().unwrap_or(false)
 }

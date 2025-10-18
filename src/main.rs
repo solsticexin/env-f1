@@ -14,23 +14,23 @@ mod actuators;
 mod dh11;
 mod lcd;
 mod light_sensor;
-mod soil_sensor;
 mod protocol;
+mod soil_sensor;
 
 // Cortex-M 运行时入口点
 use cortex_m_rt::entry;
 // 嵌入式图形库
-use actuators::{ActuatorError, Actuators};
+use actuators::Actuators;
 use core::fmt::Write;
 use defmt::{info, warn};
 use dh11::{Dht11, Error as DhtError};
 use embedded_graphics::{
     draw_target::DrawTarget,
     mono_font::{
-        ascii::{FONT_6X12, FONT_6X13_BOLD},
         MonoTextStyleBuilder,
+        ascii::{FONT_6X12, FONT_6X13_BOLD},
     },
-    pixelcolor::{raw::RawU16, Rgb565},
+    pixelcolor::{Rgb565, raw::RawU16},
     prelude::*,
     primitives::{PrimitiveStyleBuilder, Rectangle},
     text::Text,
@@ -38,12 +38,10 @@ use embedded_graphics::{
 use embedded_hal::delay::DelayNs;
 use heapless::String;
 use light_sensor::Bh1750;
-use soil_sensor::SoilSensor;
 use nb::Error as NbError;
+use soil_sensor::SoilSensor;
 // STM32F1xx HAL 库
-use protocol::{
-    AckFrame, AckResult, CommandParseError, ProtocolError, ProtocolLink, TelemetryFrame,
-};
+use protocol::{ProtocolError, ProtocolLink, TelemetryFrame};
 use stm32f1xx_hal::{
     adc::AdcExt,
     afio::AfioExt,
@@ -52,7 +50,7 @@ use stm32f1xx_hal::{
     pac,
     prelude::*,
     rcc,
-    serial::{Config as SerialConfig, Instance, SerialExt},
+    serial::{Config as SerialConfig, Error as SerialError, Instance, Rx, SerialExt},
     spi::{Mode as SpiMode, Phase, Polarity},
 };
 // SPI 模式配置：空闲时钟低电平，第一个时钟边沿捕获
@@ -114,7 +112,10 @@ fn main() -> ! {
     let mut rcc = dp.RCC.constrain();
     let _afio = dp.AFIO.constrain(&mut rcc);
     rcc = rcc.freeze(
-        rcc::Config::hse(8.MHz()).sysclk(72.MHz()).pclk1(36.MHz()),
+        rcc::Config::hse(8.MHz())
+            .sysclk(72.MHz())
+            .pclk1(36.MHz())
+            .pclk2(72.MHz()),
         &mut flash.acr,
     );
     // 开启 DWT 周期计数器以支持 I2C 阻塞实现的超时
@@ -136,13 +137,11 @@ fn main() -> ! {
     // 配置 USART1：PA9 (TX), PA10 (RX)
     let tx_pin = gpioa.pa9.into_alternate_push_pull(&mut gpioa.crh);
     let rx_pin = gpioa.pa10;
-    let serial = dp
-        .USART1
-        .serial(
-            (tx_pin, rx_pin),
-            SerialConfig::default().baudrate(115_200.bps()),
-            &mut rcc,
-        );
+    let serial = dp.USART1.serial(
+        (tx_pin, rx_pin),
+        SerialConfig::default().baudrate(115_200.bps()),
+        &mut rcc,
+    );
     let (tx, mut rx) = serial.split();
     let mut protocol_link = ProtocolLink::new(tx);
     let mut actuators = Actuators::new(water_pin, light_pin, fan_pin, buzzer_pin);
@@ -186,12 +185,8 @@ fn main() -> ! {
     let mut soil_sensor = SoilSensor::new(soil_adc, soil_pin);
     let mut light_sensor = Bh1750::new(i2c).expect("BH1750 初始化失败");
 
-    // //配置蜂鸣器引脚
-    // let mut buzzer=gpioa.pa1.into_push_pull_output(&mut gpioa.crl);
-    // buzzer.set_low();
-
-    // DHT11 初始化后延迟 2 秒
-    // DelayNs::delay_ms(&mut delay, 2_000_u32);
+    //DHT11 初始化后延迟 2 秒
+    DelayNs::delay_ms(&mut delay, 2_000_u32);
 
     // 背光引脚 PB9
     let backlight_pin = gpiob.pb9.into_push_pull_output(&mut gpiob.crh);
@@ -232,7 +227,7 @@ fn main() -> ! {
     let ip_text_origin = Point::new(8, 18);
     let scaled_background_height = BACKGROUND_HEIGHT / BACKGROUND_SCALE;
 
-    const TICK_MS: u32 = 100;
+    const TICK_MS: u32 = 1;
     const SAMPLE_PERIOD_MS: u32 = 5_000;
     let mut command_buffer: String<256> = String::new();
     let mut elapsed_ms: u32 = SAMPLE_PERIOD_MS;
@@ -240,36 +235,7 @@ fn main() -> ! {
     // 主循环：定时采集数据，并在空闲时处理控制命令
     loop {
         // 处理来自 ESP 的命令
-        loop {
-            match rx.read() {
-                Ok(byte) => {
-                    if byte == b'\n' {
-                        if let Some(b'\r') = command_buffer.as_bytes().last() {
-                            let _ = command_buffer.pop();
-                        }
-                        if !command_buffer.is_empty() {
-                            process_command_line(
-                                command_buffer.as_bytes(),
-                                &mut actuators,
-                                &mut protocol_link,
-                                &mut delay,
-                            );
-                        }
-                        command_buffer.clear();
-                    } else if byte == b'\r' {
-                        // 忽略 CR
-                    } else if command_buffer.push(byte as char).is_err() {
-                        warn!("Command line overflow, clearing buffer");
-                        command_buffer.clear();
-                    }
-                }
-                Err(NbError::WouldBlock) => break,
-                Err(NbError::Other(_)) => {
-                    warn!("UART RX error");
-                    break;
-                }
-            }
-        }
+        drain_uart(&mut rx, &mut command_buffer);
 
         if elapsed_ms >= SAMPLE_PERIOD_MS {
             elapsed_ms = 0;
@@ -282,13 +248,14 @@ fn main() -> ! {
                     let percent = SoilSensor::raw_to_percent(raw_value);
                     let _ = write!(soil_value, "{}%", percent);
                     telemetry.sensors.soil_pct = Some(percent);
-                    info!("Soil moisture: raw {} counts (~{}%)", raw_value, percent);
+                    // info!("Soil moisture: raw {} counts (~{}%)", raw_value, percent);
                 }
                 Err(_) => {
                     let _ = soil_value.push_str("--");
                     warn!("Soil sensor read error");
                 }
             }
+            drain_uart(&mut rx, &mut command_buffer);
 
             match light_sensor.read_lux_tenths(&mut delay) {
                 Ok(lux_tenths) => {
@@ -296,13 +263,14 @@ fn main() -> ! {
                     let lux_dec = lux_tenths % 10;
                     let _ = write!(light_value, "{}.{}lx", lux_int, lux_dec);
                     telemetry.sensors.lux_tenths = Some(lux_tenths);
-                    info!("BH1750: {}.{} lux", lux_int, lux_dec);
+                    // info!("BH1750: {}.{} lux", lux_int, lux_dec);
                 }
                 Err(_) => {
                     let _ = light_value.push_str("--");
                     warn!("BH1750 read error");
                 }
             }
+            drain_uart(&mut rx, &mut command_buffer);
 
             let mut temp_value: String<16> = String::new();
             let mut hum_value: String<16> = String::new();
@@ -320,10 +288,10 @@ fn main() -> ! {
                     telemetry.sensors.temperature_tenths_c =
                         Some(reading.temperature_tenths as i16);
                     telemetry.sensors.humidity_tenths_pct = Some(reading.humidity_tenths);
-                    info!(
-                        "DHT11: temp {}.{} C, humidity {}.{} %",
-                        temp_int, temp_dec, hum_int, hum_dec
-                    );
+                    // info!(
+                    //     "DHT11: temp {}.{} C, humidity {}.{} %",
+                    //     temp_int, temp_dec, hum_int, hum_dec
+                    // );
                 }
                 Err(error) => {
                     let _ = temp_value.push_str("--");
@@ -336,8 +304,10 @@ fn main() -> ! {
                     }
                 }
             }
+            drain_uart(&mut rx, &mut command_buffer);
 
             telemetry.actuators = actuators.snapshot();
+            test_print_telemetry_json(&telemetry);
 
             let clear_top = (background_origin.y - 8).max(0);
             let clear_height = (scaled_background_height + 16).min(128);
@@ -359,10 +329,12 @@ fn main() -> ! {
                 BACKGROUND_SCALE,
             )
             .unwrap();
+            drain_uart(&mut rx, &mut command_buffer);
 
             Text::new(ESP_IP, ip_text_origin, ip_text_style)
                 .draw(&mut display)
                 .unwrap();
+            drain_uart(&mut rx, &mut command_buffer);
 
             let value_texts = [
                 temp_value.as_str(),
@@ -375,6 +347,7 @@ fn main() -> ! {
                 Text::new(*text, value_text_origin + offset, value_text_style)
                     .draw(&mut display)
                     .unwrap();
+                drain_uart(&mut rx, &mut command_buffer);
             }
 
             if let Some(status) = status_line {
@@ -385,6 +358,7 @@ fn main() -> ! {
                 )
                 .draw(&mut display)
                 .unwrap();
+                drain_uart(&mut rx, &mut command_buffer);
             }
 
             if let Err(error) = protocol_link.send_data(&telemetry) {
@@ -399,51 +373,110 @@ fn main() -> ! {
         }
 
         DelayNs::delay_ms(&mut delay, TICK_MS);
+        drain_uart(&mut rx, &mut command_buffer);
         elapsed_ms = elapsed_ms.saturating_add(TICK_MS);
     }
 }
 
-fn process_command_line<USART, D>(
-    line: &[u8],
-    actuators: &mut Actuators,
-    protocol_link: &mut ProtocolLink<USART>,
-    delay: &mut D,
-) where
-    USART: Instance,
-    D: DelayNs,
-{
-    match protocol::parse_command_frame(line) {
-        Ok(command) => {
-            let apply_result = actuators.apply_command(&command, delay);
-            let ack_result = if apply_result.is_ok() {
-                AckResult::Ok
-            } else {
-                AckResult::Error
-            };
+// fn process_command_line<USART, D>(
+//     line: &[u8],
+//     actuators: &mut Actuators,
+//     protocol_link: &mut ProtocolLink<USART>,
+//     delay: &mut D,
+// ) where
+//     USART: Instance,
+//     D: DelayNs,
+// {
+//     match protocol::parse_command_frame(line) {
+//         Ok(command) => {
+//             let apply_result = actuators.apply_command(&command, delay);
+//             let ack_result = if apply_result.is_ok() {
+//                 AckResult::Ok
+//             } else {
+//                 AckResult::Error
+//             };
+//
+//             if let Err(error) = &apply_result {
+//                 match error {
+//                     ActuatorError::MissingPulseDuration => {
+//                         warn!("Pulse duration missing for command")
+//                     }
+//                 }
+//             }
+//
+//             if let Err(error) = protocol_link.send_ack(AckFrame {
+//                 target: command.target,
+//                 action: command.action,
+//                 result: ack_result,
+//             }) {
+//                 match error {
+//                     ProtocolError::BufferOverflow => warn!("Ack buffer overflow"),
+//                     ProtocolError::Serial(_serial_err) => warn!("Ack UART error"),
+//                 }
+//             }
+//         }
+//         Err(CommandParseError::Json) => warn!("Invalid JSON received"),
+//         Err(CommandParseError::UnexpectedType) => warn!("Ignoring non-command frame"),
+//         Err(CommandParseError::UnknownTarget) => warn!("Unknown command target"),
+//         Err(CommandParseError::UnknownAction) => warn!("Unknown command action"),
+//         Err(CommandParseError::MissingPulseDuration) => warn!("Pulse command missing time field"),
+//     }
+// }
 
-            if let Err(error) = &apply_result {
-                match error {
-                    ActuatorError::MissingPulseDuration => {
-                        warn!("Pulse duration missing for command")
+fn test_print_telemetry_json(frame: &TelemetryFrame) {
+    match protocol::build_data_payload(frame) {
+        Ok(payload) => {
+            let json = payload.trim_end_matches('\n');
+            info!("Telemetry JSON: {}", json);
+        }
+        Err(ProtocolError::BufferOverflow) => warn!("Telemetry JSON buffer overflow"),
+        Err(ProtocolError::Serial(_)) => warn!("Telemetry JSON serialize error"),
+    }
+}
+
+fn print_received_command_json(line: &[u8]) {
+    match core::str::from_utf8(line) {
+        Ok(text) => info!("Received command JSON: {}", text),
+        Err(_) => warn!("Received command JSON is not valid UTF-8"),
+    }
+}
+
+fn drain_uart<USART>(rx: &mut Rx<USART>, command_buffer: &mut String<256>)
+where
+    USART: Instance,
+{
+    loop {
+        match rx.read() {
+            Ok(byte) => {
+                if byte == b'\n' {
+                    if let Some(b'\r') = command_buffer.as_bytes().last() {
+                        let _ = command_buffer.pop();
                     }
+                    if !command_buffer.is_empty() {
+                        print_received_command_json(command_buffer.as_bytes());
+                    }
+                    command_buffer.clear();
+                } else if byte == b'\r' {
+                    // 忽略 CR
+                } else if command_buffer.push(byte as char).is_err() {
+                    warn!("Command line overflow, clearing buffer");
+                    command_buffer.clear();
                 }
             }
-
-            if let Err(error) = protocol_link.send_ack(AckFrame {
-                target: command.target,
-                action: command.action,
-                result: ack_result,
-            }) {
+            Err(NbError::WouldBlock) => break,
+            Err(NbError::Other(error)) => {
                 match error {
-                    ProtocolError::BufferOverflow => warn!("Ack buffer overflow"),
-                    ProtocolError::Serial(_serial_err) => warn!("Ack UART error"),
+                    SerialError::Overrun => warn!("UART RX overrun, clearing buffer"),
+                    SerialError::FrameFormat => warn!("UART RX frame format error"),
+                    SerialError::Parity => warn!("UART RX parity error"),
+                    SerialError::Noise => warn!("UART RX noise error"),
+                    SerialError::Other => warn!("UART RX unknown error"),
+                    #[allow(unreachable_patterns)]
+                    _ => warn!("UART RX unexpected error"),
                 }
+                command_buffer.clear();
+                // Clear hardware overrun flag by reading SR and DR implicitly via HAL
             }
         }
-        Err(CommandParseError::Json) => warn!("Invalid JSON received"),
-        Err(CommandParseError::UnexpectedType) => warn!("Ignoring non-command frame"),
-        Err(CommandParseError::UnknownTarget) => warn!("Unknown command target"),
-        Err(CommandParseError::UnknownAction) => warn!("Unknown command action"),
-        Err(CommandParseError::MissingPulseDuration) => warn!("Pulse command missing time field"),
     }
 }

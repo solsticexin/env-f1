@@ -94,14 +94,14 @@ where
         }
 
         // 添加调试输出（方便在 defmt 日志中查看原始字节）
-        defmt::info!(
-            "DHT11 raw data: {} {} {} {} {}",
-            data[0],
-            data[1],
-            data[2],
-            data[3],
-            data[4]
-        );
+        // defmt::info!(
+        //     "DHT11 raw data: {} {} {} {} {}",
+        //     data[0],
+        //     data[1],
+        //     data[2],
+        //     data[3],
+        //     data[4]
+        // );
 
         let humidity_tenths = u16::from(data[0]) * 10 + u16::from(data[1]);
         let temperature_tenths = u16::from(data[2]) * 10 + u16::from(data[3]);

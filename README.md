@@ -2,6 +2,9 @@
 
 > A template for building applications for STM32 microcontrollers
 
+# 此项目有bug！！！
+---
+
 ## Dependencies
 
 To build embedded programs using this template you'll need:

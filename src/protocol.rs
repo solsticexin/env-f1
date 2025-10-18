@@ -170,63 +170,7 @@ impl<USART: Instance> ProtocolLink<USART> {
 
     /// Emit a `type: "data"` JSON line that follows the communication protocol.
     pub fn send_data(&mut self, frame: &TelemetryFrame) -> Result<(), ProtocolError> {
-        let mut payload: String<DATA_BUF_CAPACITY> = String::new();
-
-        pushf!(payload, "{{\"type\":\"data\"");
-
-        // Temperature (Optional, formatted with one decimal place)
-        pushf!(payload, ",\"temp\":");
-        match frame.sensors.temperature_tenths_c {
-            Some(value) => {
-                let (sign, abs) = if value < 0 {
-                    ("-", (-value) as u16)
-                } else {
-                    ("", value as u16)
-                };
-                pushf!(payload, "{}{}.{}", sign, abs / 10, abs % 10);
-            }
-            None => pushf!(payload, "null"),
-        };
-
-        // Humidity (Optional, formatted with one decimal place)
-        pushf!(payload, ",\"humi\":");
-        match frame.sensors.humidity_tenths_pct {
-            Some(value) => pushf!(payload, "{}.{}", value / 10, value % 10),
-            None => pushf!(payload, "null"),
-        };
-
-        // Soil moisture (Optional, integer percentage)
-        pushf!(payload, ",\"soil\":");
-        match frame.sensors.soil_pct {
-            Some(value) => pushf!(payload, "{}", value),
-            None => pushf!(payload, "null"),
-        };
-
-        // Ambient light (Optional, formatted with one decimal place)
-        pushf!(payload, ",\"lux\":");
-        match frame.sensors.lux_tenths {
-            Some(value) => pushf!(payload, "{}.{}", value / 10, value % 10),
-            None => pushf!(payload, "null"),
-        };
-
-        // Actuator states (boolean as 0/1)
-        pushf!(
-            payload,
-            ",\"water\":{},\"light\":{},\"fan\":{}",
-            bool_to_bit(frame.actuators.water_on),
-            bool_to_bit(frame.actuators.light_on),
-            bool_to_bit(frame.actuators.fan_on)
-        );
-
-        pushf!(
-            payload,
-            ",\"buzzer\":{}",
-            bool_to_bit(frame.actuators.buzzer_on)
-        );
-
-        // Close the object and append newline for NDJSON framing.
-        pushf!(payload, "}}\n");
-
+        let payload = build_data_payload(frame)?;
         self.flush_bytes(payload.as_bytes())
     }
 
@@ -253,16 +197,84 @@ impl<USART: Instance> ProtocolLink<USART> {
     }
 }
 
+/// Build the telemetry JSON payload without transmitting it, mainly for testing/logging.
+pub fn build_data_payload(
+    frame: &TelemetryFrame,
+) -> Result<String<DATA_BUF_CAPACITY>, ProtocolError> {
+    let mut payload: String<DATA_BUF_CAPACITY> = String::new();
+    populate_data_payload(&mut payload, frame)?;
+    Ok(payload)
+}
+
+fn populate_data_payload(
+    payload: &mut String<DATA_BUF_CAPACITY>,
+    frame: &TelemetryFrame,
+) -> Result<(), ProtocolError> {
+    pushf!(payload, "{{\"type\":\"data\"");
+
+    // Temperature (Optional, formatted with one decimal place)
+    pushf!(payload, ",\"temp\":");
+    match frame.sensors.temperature_tenths_c {
+        Some(value) => {
+            let (sign, abs) = if value < 0 {
+                ("-", (-value) as u16)
+            } else {
+                ("", value as u16)
+            };
+            pushf!(payload, "{}{}.{}", sign, abs / 10, abs % 10);
+        }
+        None => pushf!(payload, "null"),
+    };
+
+    // Humidity (Optional, formatted with one decimal place)
+    pushf!(payload, ",\"humi\":");
+    match frame.sensors.humidity_tenths_pct {
+        Some(value) => pushf!(payload, "{}.{}", value / 10, value % 10),
+        None => pushf!(payload, "null"),
+    };
+
+    // Soil moisture (Optional, integer percentage)
+    pushf!(payload, ",\"soil\":");
+    match frame.sensors.soil_pct {
+        Some(value) => pushf!(payload, "{}", value),
+        None => pushf!(payload, "null"),
+    };
+
+    // Ambient light (Optional, formatted with one decimal place)
+    pushf!(payload, ",\"lux\":");
+    match frame.sensors.lux_tenths {
+        Some(value) => pushf!(payload, "{}.{}", value / 10, value % 10),
+        None => pushf!(payload, "null"),
+    };
+
+    // Actuator states (boolean as 0/1)
+    pushf!(
+        payload,
+        ",\"water\":{},\"light\":{},\"fan\":{}",
+        bool_to_bit(frame.actuators.water_on),
+        bool_to_bit(frame.actuators.light_on),
+        bool_to_bit(frame.actuators.fan_on)
+    );
+
+    pushf!(
+        payload,
+        ",\"buzzer\":{}",
+        bool_to_bit(frame.actuators.buzzer_on)
+    );
+
+    // Close the object and append newline for NDJSON framing.
+    pushf!(payload, "}}\n");
+
+    Ok(())
+}
+
 #[inline(always)]
 const fn bool_to_bit(value: bool) -> u8 {
-    if value {
-        1
-    } else {
-        0
-    }
+    if value { 1 } else { 0 }
 }
 
 /// Parsed representation of a `type: "cmd"` payload.
+#[allow(dead_code)]
 pub struct CommandFrame {
     pub target: CommandTarget,
     pub action: CommandAction,
@@ -271,6 +283,7 @@ pub struct CommandFrame {
 }
 
 /// Errors that can occur when parsing a command payload.
+#[allow(dead_code)]
 pub enum CommandParseError {
     /// JSON structure is syntactically invalid.
     Json,
@@ -285,6 +298,7 @@ pub enum CommandParseError {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct RawCommand<'a> {
     #[serde(rename = "type")]
     frame_type: &'a str,
@@ -295,6 +309,7 @@ struct RawCommand<'a> {
 }
 
 /// Parse a JSON line into a [`CommandFrame`].
+#[allow(dead_code)]
 pub fn parse_command_frame(line: &[u8]) -> Result<CommandFrame, CommandParseError> {
     let (raw, _consumed) =
         serde_json_core::from_slice::<RawCommand>(line).map_err(|_| CommandParseError::Json)?;
